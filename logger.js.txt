@@ -1,0 +1,62 @@
+'use strict';
+const winston = require('winston');
+const fs = require('fs');
+var sanitize = require("sanitize-filename");
+
+// Create the log directory if it does not exist
+if (!fs.existsSync('hand-log')) {
+  fs.mkdirSync('hand-log');
+}
+
+if (!fs.existsSync('debug-log')) {
+  fs.mkdirSync('debug-log');
+}
+
+if (!fs.existsSync('table-log')) {
+  fs.mkdirSync('table-log');
+}
+
+const tsFormat = () => (new Date()).toLocaleTimeString();
+const winstonLogger = new (winston.Logger)({
+  transports: [
+    new (winston.transports.Console)({
+      timestamp: tsFormat,
+      colorize: true,
+      level: 'warn'
+    }),
+    new (require('winston-daily-rotate-file'))({
+      name: 'warn',
+      filename: 'hand-log/.log',
+      timestamp: tsFormat,
+      datePattern: 'HH', // Rotate logs out every 24 hours
+      prepend: true,
+      level: 'warn',
+      maxsize: 1000000,
+      json: false
+    }),
+    new (require('winston-daily-rotate-file'))({
+      name: 'debug',
+      filename: 'debug-log/.log',
+      timestamp: tsFormat,
+      datePattern: 'HH', // Rotate logs out every 24 hours
+      prepend: true,
+      level: 'debug',
+      maxsize: 1000000,
+      json: false
+    })
+  ]
+});
+
+function tableLogger(table, message) {
+  var today = new Date().toISOString().slice(0,10);
+  fs.appendFile('table-log/' + today + '-' + sanitize(table) + '.log', message + '\r\n', function (err) {
+    if (err) {
+      // log silent
+    };
+  });
+}
+
+module.exports = {
+  wlog: winstonLogger,
+  tlog: tableLogger
+};

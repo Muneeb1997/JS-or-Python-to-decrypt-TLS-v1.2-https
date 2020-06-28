@@ -1,0 +1,236 @@
+var LOCAL_IP = '127.0.0.1';
+var DEBUG = true; // Change to true if you want to see debug logs
+var crypto = require('crypto');
+var logger = require('./logger');
+var wlogger = logger.wlog;
+var tlogger = logger.tlog;
+var _ = require('underscore');
+var Cap = require('cap').Cap;
+var fse = require('fs-extra');
+var decoders = require('cap').decoders;
+var PROTOCOL = decoders.PROTOCOL;
+
+var c = new Cap();
+var device = Cap.findDevice(LOCAL_IP);
+var filter = 'port 2095';
+var bufSize = 10 * 1024 * 1024;
+var buffer = new Buffer(65535);
+var playersFile = 'players.txt';
+
+fse.removeSync(playersFile);
+fse.outputFileSync(playersFile);
+
+fse.writeJsonSync(playersFile, []);
+
+var linkType = c.open(device, filter, bufSize, buffer);
+c.setMinBytes && c.setMinBytes(0);
+
+c.on('packet', function(nbytes, trunc) {
+  if (linkType === 'ETHERNET') {
+    var ret = decoders.Ethernet(buffer);
+
+    if (ret.info.type === PROTOCOL.ETHERNET.IPV4) {
+      ret = decoders.IPV4(buffer, ret.offset);
+
+      var srcIp = ret.info.srcaddr;
+      var dstIp = ret.info.dstaddr;
+
+      if (ret.info.protocol === PROTOCOL.IP.TCP) {
+        var datalen = ret.info.totallen - ret.hdrlen;
+        ret = decoders.TCP(buffer, ret.offset);
+        var srcPort = ret.info.srcport;
+        var dstPort = ret.info.dstport;
+        datalen -= ret.hdrlen;
+
+        var payload = extractFrame(buffer.slice(ret.offset, ret.offset + datalen));
+        if (payload) {
+          try {
+            var payString = payload.toString();
+            buildPlayersArray(srcIp, dstIp, srcPort, dstPort, JSON.parse(payString));
+          }
+          catch(e) {
+            // Problem parsing payload.
+            // catching error but not logging it
+            // so that it does not interfer with table | player | cards
+          }
+        }
+      }
+    }
+  }
+});
+
+function buildPlayersArray(srcIp, dstIp, srcPort, dstPort, payload) {
+  if (payload.Response === 'Login') {
+    playerLogin(srcIp, srcPort, payload);
+  }
+
+  if (payload.Command === 'ECards') {
+    displayCards(dstIp, dstPort, payload);
+  }
+}
+
+function playerLogin(ip, port, payload) {
+  var playerObj = {
+    id: payload.ID,
+    ip: ip,
+    port: port,
+    ipport: ip+':'+port,
+    player: payload.Player,
+    hash: payload.NextHash
+  };
+  var playersJson = fse.readJsonSync(playersFile);
+  var existingPlayer = _.findWhere(playersJson, { player: payload.Player });
+  if (existingPlayer) {
+    existingPlayer.id = playerObj.id;
+    existingPlayer.ip = playerObj.ip;
+    existingPlayer.port = playerObj.port;
+    existingPlayer.ipport = playerObj.ipport;
+    existingPlayer.player = playerObj.player;
+    existingPlayer.hash = playerObj.hash;
+    fse.writeJsonSync(playersFile, playersJson);
+    if (DEBUG) {
+      wlogger.debug('UPDATED LOGIN - Player: ' + existingPlayer.player + ' | Hash: ' + existingPlayer.hash + ' | IP: ' + existingPlayer.ip + ' | Port: ' + port + ' | IPPORT: ' + ip + ':' + port);
+    }
+  } else {
+    playersJson.push(playerObj);
+    fse.writeJsonSync(playersFile, playersJson);
+    if (DEBUG) {
+      wlogger.debug('NEW LOGIN - Player: ' + playerObj.player + ' | Hash: ' + playerObj.hash + ' | IP: ' + playerObj.ip + ' | Port: ' + port + ' | IPPORT: ' + ip + ':' + port);
+    }
+  }
+}
+
+function displayCards(ip, port, payload) {
+  if (payload.Type === 'R') {
+    var playersJson = fse.readJsonSync(playersFile);
+    var player = _.findWhere(playersJson, { ipport: ip+':'+port });
+    if (player) {
+      var cards = eCardsCommand(payload, player.hash);
+      if (cards) {
+        wlogger.warn('HAND - Table: ' + payload.Table + ' | Player: ' + player.player + ' | Cards: ' + cards);
+        tlogger(payload.Table, 'HAND - Table: ' + payload.Table + ' | Player: ' + player.player + ' | Cards: ' + cards);
+      } else {
+        if (DEBUG) {
+          wlogger.debug('HAND NOT DECODED - Player: ' + player.player + ' | Port: ' + port + ' | Hash: ' + player.hash);
+        }
+      }
+    } else {
+      if (DEBUG) {
+        wlogger.debug('PLAYER NOT FOUND ON PORT: ' + port);
+      }
+    }
+  } else {
+    if (DEBUG) {
+      wlogger.debug('NOT A RING GAME HAND');
+    }
+  }
+}
+
+function eCardsCommand(data, sessionKey) {
+	var cards = decryptCards({
+		cards: [data.Card1,data.Card2,data.Card3,data.Card4],
+		salt: data.Salt,
+		sessionKey: sessionKey
+	});
+
+  return cards;
+}
+
+function decryptCards(params) {
+	var cardList = [];
+  var cardHash = crypto.createHash('sha256').update(params.sessionKey+params.salt, 'utf8').digest('hex');
+
+	var int1 = parseInt(cardHash.substr(0, 2), 16);
+	var int2 = parseInt(cardHash.substr(2, 2), 16);
+	var int3 = parseInt(cardHash.substr(4, 2), 16);
+	var int4 = parseInt(cardHash.substr(6, 2), 16);
+
+  var card1 = cardNumToText(parseInt(params.cards[0], 16) ^ int1);
+  var card2 = cardNumToText(parseInt(params.cards[1], 16) ^ int2);
+  var card3 = cardNumToText(parseInt(params.cards[2], 16) ^ int3);
+  var card4 = cardNumToText(parseInt(params.cards[3], 16) ^ int4);
+
+	cardList.push(card1);
+	cardList.push(card2);
+	cardList.push(card3);
+	cardList.push(card4);
+
+	return _.compact(cardList);
+}
+
+function cardNumToText(cardNum) {
+	var cardTable = [
+		'2c','2d','2h','2s','3c','3d','3h','3s',
+		'4c','4d','4h','4s','5c','5d','5h','5s',
+		'6c','6d','6h','6s','7c','7d','7h','7s',
+		'8c','8d','8h','8s','9c','9d','9h','9s',
+		'Tc','Td','Th','Ts','Jc','Jd','Jh','Js',
+		'Qc','Qd','Qh','Qs','Kc','Kd','Kh','Ks',
+		'Ac','Ad','Ah','As'
+	];
+	return cardTable[cardNum-1];
+}
+
+function extractFrame (buffer) {
+	var fin, opcode, B, HB, mask, len, payload, start, i, hasMask
+
+	if (buffer.length < 2) {
+		return
+	}
+
+	// Is this the last frame in a sequence?
+	B = buffer[0]
+	HB = B >> 4
+	if (HB % 8) {
+		// RSV1, RSV2 and RSV3 must be clear
+		return false
+	}
+	fin = HB === 8
+	opcode = B % 16
+
+	if (opcode !== 0 && opcode !== 1 && opcode !== 2 &&
+		opcode !== 8 && opcode !== 9 && opcode !== 10) {
+		// Invalid opcode
+		return false
+	}
+	if (opcode >= 8 && !fin) {
+		// Control frames must not be fragmented
+		return false
+	}
+
+	B = buffer[1]
+	hasMask = B >> 7
+	len = B % 128
+	start = hasMask ? 6 : 2
+
+	if (buffer.length < start + len) {
+		// Not enough data in the buffer
+		return
+	}
+
+	// Get the actual payload length
+	if (len === 126) {
+		len = buffer.readUInt16BE(2)
+		start += 2
+	} else if (len === 127) {
+		// Warning: JS can only store up to 2^53 in its number format
+		len = buffer.readUInt32BE(2) * Math.pow(2, 32) + buffer.readUInt32BE(6)
+		start += 8
+	}
+	if (buffer.length < start + len) {
+		return
+	}
+
+	// Extract the payload
+	payload = buffer.slice(start, start + len)
+	if (hasMask) {
+		// Decode with the given mask
+		mask = buffer.slice(start - 4, start)
+		for (i = 0; i < payload.length; i++) {
+			payload[i] ^= mask[i % 4]
+		}
+	}
+	buffer = buffer.slice(start + len)
+
+  return payload;
+}
